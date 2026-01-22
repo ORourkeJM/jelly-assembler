@@ -589,3 +589,150 @@ async def serve_file(filename: str):
         raise HTTPException(status_code=404, detail="File not found")
 
     return FileResponse(file_path, media_type="video/mp4", filename=filename)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Video Refinement (Veo 3.1)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class RefineRequest(BaseModel):
+    """Request for video refinement using Veo."""
+    prompt: str = Field(..., description="Description of desired video")
+    first_frame_url: Optional[str] = Field(None, description="URL of starting frame image")
+    last_frame_url: Optional[str] = Field(None, description="URL of ending frame image")
+    reference_image_urls: Optional[list[str]] = Field(None, description="Style/character reference images")
+    duration_seconds: int = Field(8, description="Video duration (4, 6, or 8 seconds)")
+    aspect_ratio: str = Field("9:16", description="Aspect ratio: 9:16 or 16:9")
+    model: str = Field("fast", description="Model: fast ($0.10/s) or standard ($0.40/s)")
+
+
+class TransitionRequest(BaseModel):
+    """Request for creating a transition between frames."""
+    first_frame_url: str = Field(..., description="URL of first frame (end of clip 1)")
+    last_frame_url: str = Field(..., description="URL of last frame (start of clip 2)")
+    prompt: str = Field(..., description="Description of transition style")
+    duration_seconds: int = Field(4, description="Transition duration (4, 6, or 8 seconds)")
+
+
+@app.post("/api/v1/refine")
+async def refine_video(request: RefineRequest, background_tasks: BackgroundTasks):
+    """
+    Generate or refine video using Google Veo 3.1.
+
+    Supports:
+    - Text-to-video: Just provide prompt
+    - Image-to-video: Provide first_frame_url
+    - Frames-to-video: Provide first_frame_url and last_frame_url
+    - Style consistency: Provide reference_image_urls
+    """
+    from app.veo_refiner import get_veo_refiner, VeoRequest, VeoModel
+
+    refiner = get_veo_refiner()
+
+    model = VeoModel.VEO_31_FAST if request.model == "fast" else VeoModel.VEO_31
+
+    job_id = uuid.uuid4().hex[:16]
+    jobs[job_id] = {
+        "job_id": job_id,
+        "status": "pending",
+        "stage": "refine",
+        "progress": 0,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+
+    async def run_refinement():
+        update_job(job_id, status="processing", progress=10)
+
+        result = await refiner.generate(VeoRequest(
+            prompt=request.prompt,
+            first_frame_url=request.first_frame_url,
+            last_frame_url=request.last_frame_url,
+            reference_image_urls=request.reference_image_urls,
+            duration_seconds=request.duration_seconds,
+            aspect_ratio=request.aspect_ratio,
+            model=model
+        ))
+
+        if result.success:
+            update_job(
+                job_id,
+                status="complete",
+                progress=100,
+                completed_at=datetime.utcnow().isoformat(),
+                output_url=result.video_url,
+                duration=result.duration,
+                processing_time_ms=result.processing_time_ms
+            )
+        else:
+            update_job(
+                job_id,
+                status="failed",
+                completed_at=datetime.utcnow().isoformat(),
+                error=result.error
+            )
+
+    background_tasks.add_task(run_refinement)
+
+    return JobResponse(
+        job_id=job_id,
+        status="pending",
+        message=f"Veo refinement started ({request.model} model)"
+    )
+
+
+@app.post("/api/v1/transition")
+async def create_transition(request: TransitionRequest, background_tasks: BackgroundTasks):
+    """
+    Create a smooth transition between two video clips.
+
+    Provide the last frame of clip 1 and first frame of clip 2.
+    Veo will generate a smooth transition between them.
+    """
+    from app.veo_refiner import get_veo_refiner
+
+    refiner = get_veo_refiner()
+
+    job_id = uuid.uuid4().hex[:16]
+    jobs[job_id] = {
+        "job_id": job_id,
+        "status": "pending",
+        "stage": "transition",
+        "progress": 0,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+
+    async def run_transition():
+        update_job(job_id, status="processing", progress=10)
+
+        result = await refiner.create_transition(
+            first_frame_url=request.first_frame_url,
+            last_frame_url=request.last_frame_url,
+            prompt=request.prompt,
+            duration=request.duration_seconds
+        )
+
+        if result.success:
+            update_job(
+                job_id,
+                status="complete",
+                progress=100,
+                completed_at=datetime.utcnow().isoformat(),
+                output_url=result.video_url,
+                duration=result.duration,
+                processing_time_ms=result.processing_time_ms
+            )
+        else:
+            update_job(
+                job_id,
+                status="failed",
+                completed_at=datetime.utcnow().isoformat(),
+                error=result.error
+            )
+
+    background_tasks.add_task(run_transition)
+
+    return JobResponse(
+        job_id=job_id,
+        status="pending",
+        message=f"Creating {request.duration_seconds}s transition"
+    )

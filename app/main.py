@@ -16,7 +16,7 @@ from datetime import datetime
 from typing import Optional
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -298,6 +298,79 @@ async def list_jobs(status: Optional[str] = None, limit: int = 50):
     result.sort(key=lambda j: j.get("created_at", ""), reverse=True)
 
     return {"jobs": result[:limit], "total": len(result)}
+
+
+@app.post("/api/v1/upload")
+async def upload_file(
+    file: UploadFile = File(...),
+    folder: str = Form("uploads"),
+):
+    """
+    Upload a file to R2 storage.
+
+    Returns the public URL of the uploaded file.
+    """
+    global storage
+
+    if not storage:
+        raise HTTPException(status_code=500, detail="Storage not initialized")
+
+    # Validate file type
+    allowed_types = ["video/mp4", "audio/mpeg", "audio/mp3", "audio/wav", "video/quicktime"]
+    content_type = file.content_type or "application/octet-stream"
+
+    if content_type not in allowed_types and not content_type.startswith("video/") and not content_type.startswith("audio/"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid file type: {content_type}. Allowed: video/*, audio/*"
+        )
+
+    # Save to temp file
+    import tempfile
+    import shutil
+
+    ext = os.path.splitext(file.filename or "file")[1] or ".mp4"
+
+    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+        shutil.copyfileobj(file.file, tmp)
+        tmp_path = tmp.name
+
+    try:
+        # Upload to R2 with custom folder
+        from datetime import datetime
+
+        file_id = uuid.uuid4().hex[:12]
+        key = f"{folder}/{file_id}{ext}"
+
+        # Direct R2 upload with custom key
+        if hasattr(storage, 'client') and storage.client:
+            with open(tmp_path, "rb") as f:
+                storage.client.put_object(
+                    Bucket=storage.bucket_name,
+                    Key=key,
+                    Body=f,
+                    ContentType=content_type,
+                )
+            url = f"{storage.public_url_base}/{key}"
+        else:
+            # Fallback to standard upload
+            url = await storage.upload(tmp_path, content_type)
+
+        logger.info("File uploaded", filename=file.filename, key=key, url=url)
+
+        return {
+            "success": True,
+            "url": url,
+            "key": key,
+            "filename": file.filename,
+            "content_type": content_type,
+            "size_bytes": os.path.getsize(tmp_path)
+        }
+
+    finally:
+        # Cleanup temp file
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

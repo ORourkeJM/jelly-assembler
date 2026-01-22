@@ -1,0 +1,518 @@
+"""
+Jelly Assembler - Video Assembly Service
+
+FastAPI service that assembles video clips, runs AI refinement, and adds audio overlay.
+
+Pipeline:
+1. Assemble - Concatenate clips into single video (no audio)
+2. Refine - Send to AI refinement service (optional)
+3. Finalize - Overlay audio track
+"""
+
+import os
+import uuid
+import asyncio
+from datetime import datetime
+from typing import Optional
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
+import structlog
+
+from app.assembler import VideoAssembler, ClipInfo
+from app.storage import get_storage_handler
+
+# Configure structured logging
+structlog.configure(
+    processors=[
+        structlog.processors.TimeStamper(fmt="iso"),
+        structlog.processors.add_log_level,
+        structlog.dev.ConsoleRenderer()
+    ]
+)
+
+logger = structlog.get_logger(__name__)
+
+# Global instances
+assembler: Optional[VideoAssembler] = None
+storage = None
+jobs: dict[str, dict] = {}  # In-memory job tracking
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan handler."""
+    global assembler, storage
+
+    # Startup
+    assembler = VideoAssembler()
+    storage = get_storage_handler()
+    logger.info("Jelly Assembler started")
+
+    yield
+
+    # Shutdown
+    if assembler:
+        assembler.cleanup()
+    logger.info("Jelly Assembler stopped")
+
+
+app = FastAPI(
+    title="Jelly Assembler",
+    description="Video assembly pipeline - combines clips, refines with AI, adds audio",
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Request/Response Models
+# ═══════════════════════════════════════════════════════════════════════════
+
+class ClipInput(BaseModel):
+    """Input for a single video clip."""
+    url: str = Field(..., description="URL to download the clip from")
+    order: int = Field(..., description="Order in final video (0-indexed)")
+    duration: Optional[float] = Field(None, description="Clip duration in seconds")
+
+
+class PipelineRequest(BaseModel):
+    """Request for full assembly pipeline."""
+    clips: list[ClipInput] = Field(..., description="List of clips to combine")
+    audio_url: str = Field(..., description="URL of audio track")
+    audio_start: float = Field(0.0, description="Start offset in audio (seconds)")
+    audio_end: Optional[float] = Field(None, description="End offset in audio (seconds)")
+    quality: str = Field("standard", description="Quality preset: draft, standard, premium")
+    resolution: str = Field("1080x1920", description="Output resolution (WxH)")
+    fps: int = Field(30, description="Output framerate")
+    refinement_type: Optional[str] = Field(None, description="AI refinement: consistency, upscale, smooth")
+    callback_url: Optional[str] = Field(None, description="Webhook URL for completion")
+
+
+class AssembleOnlyRequest(BaseModel):
+    """Request for assembly only (no audio, no refinement)."""
+    clips: list[ClipInput] = Field(..., description="List of clips to combine")
+    resolution: str = Field("1080x1920", description="Output resolution (WxH)")
+    fps: int = Field(30, description="Output framerate")
+
+
+class FinalizeRequest(BaseModel):
+    """Request to add audio to a video."""
+    video_url: str = Field(..., description="URL of video to add audio to")
+    audio_url: str = Field(..., description="URL of audio track")
+    audio_start: float = Field(0.0, description="Start offset in audio (seconds)")
+    audio_end: Optional[float] = Field(None, description="End offset in audio (seconds)")
+    quality: str = Field("standard", description="Quality preset")
+
+
+class JobResponse(BaseModel):
+    """Response for job creation."""
+    job_id: str
+    status: str
+    message: str
+
+
+class JobStatus(BaseModel):
+    """Status of a job."""
+    job_id: str
+    status: str  # pending, processing, complete, failed
+    stage: Optional[str] = None  # assemble, refine, finalize
+    progress: Optional[int] = None
+    created_at: str
+    completed_at: Optional[str] = None
+    output_url: Optional[str] = None
+    duration: Optional[float] = None
+    file_size_bytes: Optional[int] = None
+    processing_time_ms: Optional[float] = None
+    error: Optional[str] = None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Endpoints
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    return {
+        "status": "healthy",
+        "service": "jelly-assembler",
+        "version": "1.0.0",
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+
+@app.post("/api/v1/pipeline", response_model=JobResponse)
+async def create_pipeline_job(
+    request: PipelineRequest,
+    background_tasks: BackgroundTasks
+):
+    """
+    Create a full pipeline job: Assemble → Refine → Finalize.
+
+    The job runs in the background. Poll /api/v1/jobs/{job_id} for status.
+    """
+    job_id = uuid.uuid4().hex[:16]
+
+    # Validate clips
+    if not request.clips:
+        raise HTTPException(status_code=400, detail="At least one clip required")
+
+    if len(request.clips) > 20:
+        raise HTTPException(status_code=400, detail="Maximum 20 clips allowed")
+
+    # Create job record
+    jobs[job_id] = {
+        "job_id": job_id,
+        "status": "pending",
+        "stage": "queued",
+        "progress": 0,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+
+    # Start background processing
+    background_tasks.add_task(
+        process_pipeline_job,
+        job_id,
+        request,
+        request.callback_url
+    )
+
+    logger.info(
+        "Pipeline job created",
+        job_id=job_id,
+        num_clips=len(request.clips),
+        refinement=request.refinement_type
+    )
+
+    return JobResponse(
+        job_id=job_id,
+        status="pending",
+        message=f"Pipeline started with {len(request.clips)} clips"
+    )
+
+
+@app.post("/api/v1/assemble", response_model=JobResponse)
+async def create_assemble_job(
+    request: AssembleOnlyRequest,
+    background_tasks: BackgroundTasks
+):
+    """
+    Assemble clips only (no audio, no refinement).
+
+    Use this for the first stage, then call /api/v1/finalize to add audio.
+    """
+    job_id = uuid.uuid4().hex[:16]
+
+    if not request.clips:
+        raise HTTPException(status_code=400, detail="At least one clip required")
+
+    jobs[job_id] = {
+        "job_id": job_id,
+        "status": "pending",
+        "stage": "assemble",
+        "progress": 0,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+
+    background_tasks.add_task(process_assemble_job, job_id, request)
+
+    return JobResponse(
+        job_id=job_id,
+        status="pending",
+        message=f"Assembly started with {len(request.clips)} clips"
+    )
+
+
+@app.post("/api/v1/finalize", response_model=JobResponse)
+async def create_finalize_job(
+    request: FinalizeRequest,
+    background_tasks: BackgroundTasks
+):
+    """
+    Add audio to a video (finalization stage).
+
+    Use after assembly and/or refinement.
+    """
+    job_id = uuid.uuid4().hex[:16]
+
+    jobs[job_id] = {
+        "job_id": job_id,
+        "status": "pending",
+        "stage": "finalize",
+        "progress": 0,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+
+    background_tasks.add_task(process_finalize_job, job_id, request)
+
+    return JobResponse(
+        job_id=job_id,
+        status="pending",
+        message="Finalization started"
+    )
+
+
+@app.get("/api/v1/jobs/{job_id}", response_model=JobStatus)
+async def get_job_status(job_id: str):
+    """Get the status of a job."""
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    return JobStatus(**jobs[job_id])
+
+
+@app.delete("/api/v1/jobs/{job_id}")
+async def delete_job(job_id: str):
+    """Delete a job and clean up its files."""
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    if assembler:
+        assembler.cleanup(job_id)
+
+    del jobs[job_id]
+    return {"status": "deleted", "job_id": job_id}
+
+
+@app.get("/api/v1/jobs")
+async def list_jobs(status: Optional[str] = None, limit: int = 50):
+    """List recent jobs."""
+    result = list(jobs.values())
+
+    if status:
+        result = [j for j in result if j.get("status") == status]
+
+    result.sort(key=lambda j: j.get("created_at", ""), reverse=True)
+
+    return {"jobs": result[:limit], "total": len(result)}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Background Processing
+# ═══════════════════════════════════════════════════════════════════════════
+
+def update_job(job_id: str, **kwargs):
+    """Update job status."""
+    if job_id in jobs:
+        jobs[job_id].update(kwargs)
+
+
+async def process_pipeline_job(
+    job_id: str,
+    request: PipelineRequest,
+    callback_url: Optional[str] = None
+):
+    """Run full pipeline: Assemble → Refine → Finalize."""
+    global assembler, storage
+
+    def on_progress(stage: str, pct: int, msg: str):
+        update_job(job_id, stage=stage, progress=pct, status="processing")
+
+    update_job(job_id, status="processing", stage="assemble", progress=0)
+
+    try:
+        clips = [
+            ClipInfo(url=c.url, order=c.order, duration=c.duration)
+            for c in request.clips
+        ]
+
+        result = await assembler.run_pipeline(
+            job_id=job_id,
+            clips=clips,
+            audio_url=request.audio_url,
+            audio_start=request.audio_start,
+            audio_end=request.audio_end,
+            resolution=request.resolution,
+            fps=request.fps,
+            quality=request.quality,
+            refinement_type=request.refinement_type,
+            on_progress=on_progress
+        )
+
+        if result.success:
+            output_url = await storage.upload(result.output_path)
+
+            update_job(
+                job_id,
+                status="complete",
+                stage="done",
+                progress=100,
+                completed_at=datetime.utcnow().isoformat(),
+                output_url=output_url,
+                duration=result.duration,
+                file_size_bytes=result.file_size_bytes,
+                processing_time_ms=result.processing_time_ms,
+            )
+
+            logger.info("Pipeline complete", job_id=job_id, output_url=output_url)
+        else:
+            update_job(
+                job_id,
+                status="failed",
+                completed_at=datetime.utcnow().isoformat(),
+                error=result.error,
+                processing_time_ms=result.processing_time_ms,
+            )
+
+        if callback_url:
+            await send_callback(callback_url, jobs[job_id])
+
+    except Exception as e:
+        logger.error(f"Pipeline error: {e}", job_id=job_id)
+        update_job(
+            job_id,
+            status="failed",
+            completed_at=datetime.utcnow().isoformat(),
+            error=str(e)
+        )
+
+
+async def process_assemble_job(job_id: str, request: AssembleOnlyRequest):
+    """Run assembly stage only."""
+    global assembler, storage
+
+    update_job(job_id, status="processing", stage="assemble", progress=10)
+
+    try:
+        from app.assembler import AssemblyJob
+
+        clips = [
+            ClipInfo(url=c.url, order=c.order, duration=c.duration)
+            for c in request.clips
+        ]
+
+        job = AssemblyJob(
+            job_id=job_id,
+            clips=clips,
+            resolution=request.resolution,
+            fps=request.fps
+        )
+
+        result = await assembler.assemble(job)
+
+        if result.success:
+            output_url = await storage.upload(result.output_path)
+
+            update_job(
+                job_id,
+                status="complete",
+                stage="assemble",
+                progress=100,
+                completed_at=datetime.utcnow().isoformat(),
+                output_url=output_url,
+                duration=result.duration,
+                file_size_bytes=result.file_size_bytes,
+                processing_time_ms=result.processing_time_ms,
+            )
+        else:
+            update_job(
+                job_id,
+                status="failed",
+                completed_at=datetime.utcnow().isoformat(),
+                error=result.error,
+            )
+
+    except Exception as e:
+        logger.error(f"Assemble error: {e}", job_id=job_id)
+        update_job(job_id, status="failed", error=str(e))
+
+
+async def process_finalize_job(job_id: str, request: FinalizeRequest):
+    """Run finalization (add audio) stage only."""
+    global assembler, storage
+
+    update_job(job_id, status="processing", stage="finalize", progress=10)
+
+    try:
+        from app.assembler import FinalizeJob
+        import tempfile
+        import httpx
+
+        # Download video to temp file
+        job_dir = os.path.join(assembler.work_dir, job_id)
+        os.makedirs(job_dir, exist_ok=True)
+
+        video_path = os.path.join(job_dir, "input.mp4")
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.get(request.video_url, follow_redirects=True)
+            response.raise_for_status()
+            with open(video_path, "wb") as f:
+                f.write(response.content)
+
+        job = FinalizeJob(
+            job_id=job_id,
+            video_path=video_path,
+            audio_url=request.audio_url,
+            audio_start=request.audio_start,
+            audio_end=request.audio_end,
+            quality=request.quality
+        )
+
+        result = await assembler.finalize(job)
+
+        if result.success:
+            output_url = await storage.upload(result.output_path)
+
+            update_job(
+                job_id,
+                status="complete",
+                stage="finalize",
+                progress=100,
+                completed_at=datetime.utcnow().isoformat(),
+                output_url=output_url,
+                duration=result.duration,
+                file_size_bytes=result.file_size_bytes,
+                processing_time_ms=result.processing_time_ms,
+            )
+        else:
+            update_job(
+                job_id,
+                status="failed",
+                completed_at=datetime.utcnow().isoformat(),
+                error=result.error,
+            )
+
+    except Exception as e:
+        logger.error(f"Finalize error: {e}", job_id=job_id)
+        update_job(job_id, status="failed", error=str(e))
+
+
+async def send_callback(url: str, data: dict):
+    """Send webhook callback."""
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            await client.post(url, json=data)
+            logger.info("Callback sent", url=url)
+    except Exception as e:
+        logger.warning(f"Callback failed: {e}", url=url)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Local file serving (dev mode)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.get("/files/{filename}")
+async def serve_file(filename: str):
+    """Serve assembled files in dev mode."""
+    output_dir = os.environ.get("LOCAL_OUTPUT_DIR", "/tmp/jelly-assembler-output")
+    file_path = os.path.join(output_dir, filename)
+
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+
+    return FileResponse(file_path, media_type="video/mp4", filename=filename)

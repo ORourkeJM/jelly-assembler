@@ -98,11 +98,20 @@ class VeoRefiner:
         if json_creds:
             try:
                 import json
+                import re
                 from google.oauth2 import service_account
                 from google.auth.transport.requests import Request
 
                 logger.info(f"JSON creds length: {len(json_creds)}")
-                creds_dict = json.loads(json_creds)
+
+                # Fix common issues with env var JSON:
+                # 1. Replace literal newlines with escaped newlines
+                # 2. Handle Railway's escaping
+                fixed_creds = json_creds.replace('\n', '\\n').replace('\r', '')
+                # But don't double-escape already escaped newlines
+                fixed_creds = re.sub(r'\\\\n', r'\\n', fixed_creds)
+
+                creds_dict = json.loads(fixed_creds)
                 logger.info(f"Parsed JSON, project_id: {creds_dict.get('project_id')}")
 
                 credentials = service_account.Credentials.from_service_account_info(

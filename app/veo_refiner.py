@@ -93,21 +93,28 @@ class VeoRefiner:
         """Get Google Cloud access token."""
         # Try JSON credentials from environment first
         json_creds = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS_JSON")
+        logger.info(f"GOOGLE_APPLICATION_CREDENTIALS_JSON present: {bool(json_creds)}")
+
         if json_creds:
             try:
                 import json
                 from google.oauth2 import service_account
                 from google.auth.transport.requests import Request
 
+                logger.info(f"JSON creds length: {len(json_creds)}")
                 creds_dict = json.loads(json_creds)
+                logger.info(f"Parsed JSON, project_id: {creds_dict.get('project_id')}")
+
                 credentials = service_account.Credentials.from_service_account_info(
                     creds_dict,
                     scopes=["https://www.googleapis.com/auth/cloud-platform"]
                 )
+                logger.info("Created credentials object, refreshing...")
                 credentials.refresh(Request())
+                logger.info("Token obtained successfully")
                 return credentials.token
             except Exception as e:
-                logger.error(f"Failed to use JSON credentials: {e}")
+                logger.error(f"Failed to use JSON credentials: {e}", exc_info=True)
 
         # Try using gcloud CLI
         try:

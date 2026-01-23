@@ -736,3 +736,158 @@ async def create_transition(request: TransitionRequest, background_tasks: Backgr
         status="pending",
         message=f"Creating {request.duration_seconds}s transition"
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Video Refinement (fal.ai Kling O1) - Alternative to Veo
+# ═══════════════════════════════════════════════════════════════════════════
+
+class FalRefineRequest(BaseModel):
+    """Request for video refinement using fal.ai Kling O1."""
+    video_url: str = Field(..., description="URL of video to refine")
+    prompt: str = Field(..., description="Description of desired refinement")
+    mode: str = Field("edit", description="Mode: edit (fix issues) or consistency (match style)")
+    style_image_urls: Optional[list[str]] = Field(None, description="Style reference images (up to 4)")
+    element_images: Optional[list[dict]] = Field(None, description="Character/object references")
+    keep_audio: bool = Field(False, description="Preserve original audio")
+
+
+@app.post("/api/v1/refine/fal")
+async def refine_video_fal(request: FalRefineRequest, background_tasks: BackgroundTasks):
+    """
+    Refine video using fal.ai Kling O1 models.
+
+    Alternative to Veo - costs $0.168/second.
+
+    Modes:
+    - edit: Polish/fix specific elements while preserving composition
+    - consistency: Maintain visual coherence using style references
+
+    Example:
+        POST /api/v1/refine/fal
+        {
+            "video_url": "https://...",
+            "prompt": "Enhance colors, smooth motion, add cinematic look",
+            "mode": "edit"
+        }
+    """
+    from app.video_refiner import get_video_refiner, RefinementRequest, RefinementMode
+
+    refiner = get_video_refiner()
+
+    if not refiner.api_key:
+        raise HTTPException(status_code=500, detail="FAL_KEY not configured")
+
+    mode = RefinementMode.EDIT if request.mode == "edit" else RefinementMode.CONSISTENCY
+
+    job_id = uuid.uuid4().hex[:16]
+    jobs[job_id] = {
+        "job_id": job_id,
+        "status": "pending",
+        "stage": "refine",
+        "progress": 0,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+
+    async def run_fal_refinement():
+        update_job(job_id, status="processing", progress=10)
+
+        result = await refiner.refine(RefinementRequest(
+            video_url=request.video_url,
+            prompt=request.prompt,
+            mode=mode,
+            style_image_urls=request.style_image_urls,
+            element_images=request.element_images,
+            keep_audio=request.keep_audio
+        ))
+
+        if result.success:
+            update_job(
+                job_id,
+                status="complete",
+                progress=100,
+                completed_at=datetime.utcnow().isoformat(),
+                output_url=result.video_url,
+                duration=result.duration,
+                processing_time_ms=result.processing_time_ms
+            )
+        else:
+            update_job(
+                job_id,
+                status="failed",
+                completed_at=datetime.utcnow().isoformat(),
+                error=result.error
+            )
+
+    background_tasks.add_task(run_fal_refinement)
+
+    return JobResponse(
+        job_id=job_id,
+        status="pending",
+        message=f"fal.ai refinement started ({request.mode} mode)"
+    )
+
+
+@app.post("/api/v1/polish")
+async def polish_clip(
+    video_url: str,
+    style: str = "cinematic",
+    fix_issues: Optional[list[str]] = None,
+    background_tasks: BackgroundTasks = None
+):
+    """
+    Convenience endpoint to polish a single video clip.
+
+    Example:
+        POST /api/v1/polish?video_url=https://...&style=neon%20aesthetic
+    """
+    from app.video_refiner import get_video_refiner
+
+    refiner = get_video_refiner()
+
+    if not refiner.api_key:
+        raise HTTPException(status_code=500, detail="FAL_KEY not configured")
+
+    job_id = uuid.uuid4().hex[:16]
+    jobs[job_id] = {
+        "job_id": job_id,
+        "status": "pending",
+        "stage": "polish",
+        "progress": 0,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+
+    async def run_polish():
+        update_job(job_id, status="processing", progress=10)
+
+        result = await refiner.polish_clip(
+            video_url=video_url,
+            style_description=style,
+            fix_issues=fix_issues or []
+        )
+
+        if result.success:
+            update_job(
+                job_id,
+                status="complete",
+                progress=100,
+                completed_at=datetime.utcnow().isoformat(),
+                output_url=result.video_url,
+                duration=result.duration,
+                processing_time_ms=result.processing_time_ms
+            )
+        else:
+            update_job(
+                job_id,
+                status="failed",
+                completed_at=datetime.utcnow().isoformat(),
+                error=result.error
+            )
+
+    background_tasks.add_task(run_polish)
+
+    return JobResponse(
+        job_id=job_id,
+        status="pending",
+        message=f"Polishing clip with {style} style"
+    )

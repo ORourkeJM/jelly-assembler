@@ -74,7 +74,8 @@ class VideoRefiner:
         if not self.api_key:
             logger.warning("FAL_KEY not configured - video refinement disabled")
 
-        self.base_url = "https://queue.fal.run"
+        self.base_url = "https://fal.run"  # Direct run endpoint
+        self.queue_url = "https://queue.fal.run"  # Queue endpoint for async
 
     async def refine(self, request: RefinementRequest) -> RefinementResult:
         """
@@ -174,58 +175,59 @@ class VideoRefiner:
         }
 
         async with httpx.AsyncClient(timeout=timeout) as client:
-            # Submit job
+            # Use synchronous endpoint (waits for completion)
             submit_url = f"{self.base_url}/{endpoint}"
-            logger.info("Submitting refinement job", endpoint=endpoint)
+            logger.info("Submitting refinement job", endpoint=endpoint, url=submit_url)
 
-            response = await client.post(submit_url, json=payload, headers=headers)
-            response.raise_for_status()
+            try:
+                response = await client.post(submit_url, json=payload, headers=headers)
 
-            result = response.json()
-            request_id = result.get("request_id")
+                # Log response for debugging
+                logger.info("fal.ai response", status=response.status_code)
 
-            if not request_id:
-                return RefinementResult(
-                    success=False,
-                    error="No request_id in response"
-                )
-
-            # Poll for completion
-            status_url = f"{self.base_url}/{endpoint}/requests/{request_id}/status"
-            result_url = f"https://fal.run/{endpoint}/requests/{request_id}"
-
-            for attempt in range(60):  # Max 5 minutes of polling
-                await asyncio.sleep(5)
-
-                status_response = await client.get(status_url, headers=headers)
-                status_data = status_response.json()
-
-                status = status_data.get("status")
-                logger.debug(f"Refinement status: {status}", attempt=attempt)
-
-                if status == "COMPLETED":
-                    # Get result
-                    result_response = await client.get(result_url, headers=headers)
-                    result_data = result_response.json()
-
-                    video_info = result_data.get("video", {})
-                    return RefinementResult(
-                        success=True,
-                        video_url=video_info.get("url"),
-                        file_size_bytes=video_info.get("file_size"),
-                    )
-
-                elif status == "FAILED":
-                    error = status_data.get("error", "Unknown error")
+                if response.status_code != 200:
+                    error_text = response.text
+                    logger.error("fal.ai error response", status=response.status_code, body=error_text[:500])
                     return RefinementResult(
                         success=False,
-                        error=f"fal.ai job failed: {error}"
+                        error=f"fal.ai HTTP {response.status_code}: {error_text[:200]}"
                     )
 
-            return RefinementResult(
-                success=False,
-                error="Refinement timed out"
-            )
+                result = response.json()
+
+                # Extract video from response
+                video_info = result.get("video", {})
+                if isinstance(video_info, dict):
+                    video_url = video_info.get("url")
+                else:
+                    video_url = result.get("video_url") or result.get("output", {}).get("url")
+
+                if video_url:
+                    return RefinementResult(
+                        success=True,
+                        video_url=video_url,
+                        file_size_bytes=video_info.get("file_size") if isinstance(video_info, dict) else None,
+                    )
+                else:
+                    logger.warning("No video URL in response", response=result)
+                    return RefinementResult(
+                        success=False,
+                        error=f"No video URL in response: {str(result)[:200]}"
+                    )
+
+            except httpx.HTTPStatusError as e:
+                error_text = e.response.text if e.response else str(e)
+                logger.error("fal.ai HTTP error", error=error_text[:500])
+                return RefinementResult(
+                    success=False,
+                    error=f"fal.ai HTTP error: {error_text[:200]}"
+                )
+            except Exception as e:
+                logger.error("fal.ai request failed", error=str(e))
+                return RefinementResult(
+                    success=False,
+                    error=f"fal.ai request failed: {str(e)}"
+                )
 
     async def polish_clip(
         self,
